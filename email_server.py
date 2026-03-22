@@ -15,14 +15,14 @@
 # limitations under the License.
 
 from concurrent import futures
-import argparse
 import os
-import sys
 import time
-import grpc
+import smtplib
 import traceback
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+import grpc
 from jinja2 import Environment, FileSystemLoader, select_autoescape, TemplateError
-from google.api_core.exceptions import GoogleAPICallError
 from google.auth.exceptions import DefaultCredentialsError
 
 import demo_pb2
@@ -36,9 +36,6 @@ from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import BatchSpanProcessor
 from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
 
-# @TODO: Temporarily removed in https://github.com/GoogleCloudPlatform/microservices-demo/pull/3196
-# import googlecloudprofiler
-
 from logger import getJSONLogger
 logger = getJSONLogger('emailservice-server')
 
@@ -49,86 +46,88 @@ env = Environment(
 )
 template = env.get_template('confirmation.html')
 
+
 class BaseEmailService(demo_pb2_grpc.EmailServiceServicer):
   def Check(self, request, context):
     return health_pb2.HealthCheckResponse(
       status=health_pb2.HealthCheckResponse.SERVING)
-  
+
   def Watch(self, request, context):
     return health_pb2.HealthCheckResponse(
       status=health_pb2.HealthCheckResponse.UNIMPLEMENTED)
 
-class EmailService(BaseEmailService):
+
+class GmailEmailService(BaseEmailService):
+  """Sends real order confirmation emails via Gmail SMTP.
+
+  Requires env vars:
+    GMAIL_ADDRESS      - the Gmail address used as sender (e.g. you@gmail.com)
+    GMAIL_APP_PASSWORD - a Gmail App Password (not your regular password)
+  """
+
   def __init__(self):
-    raise Exception('cloud mail client not implemented')
+    self.gmail_address = os.environ['GMAIL_ADDRESS']
+    self.gmail_app_password = os.environ['GMAIL_APP_PASSWORD']
     super().__init__()
 
-  @staticmethod
-  def send_email(client, email_address, content):
-    response = client.send_message(
-      sender = client.sender_path(project_id, region, sender_id),
-      envelope_from_authority = '',
-      header_from_authority = '',
-      envelope_from_address = from_address,
-      simple_message = {
-        "from": {
-          "address_spec": from_address,
-        },
-        "to": [{
-          "address_spec": email_address
-        }],
-        "subject": "Your Confirmation Email",
-        "html_body": content
-      }
-    )
-    logger.info("Message sent: {}".format(response.rfc822_message_id))
+  def _send_email(self, to_address, html_content):
+    msg = MIMEMultipart('alternative')
+    msg['Subject'] = 'Your Order Confirmation'
+    msg['From'] = self.gmail_address
+    msg['To'] = to_address
+    msg.attach(MIMEText(html_content, 'html'))
+
+    with smtplib.SMTP('smtp.gmail.com', 587) as smtp:
+      smtp.ehlo()
+      smtp.starttls()
+      smtp.login(self.gmail_address, self.gmail_app_password)
+      smtp.sendmail(self.gmail_address, to_address, msg.as_string())
 
   def SendOrderConfirmation(self, request, context):
     email = request.email
     order = request.order
 
     try:
-      confirmation = template.render(order = order)
+      confirmation = template.render(order=order)
     except TemplateError as err:
       context.set_details("An error occurred when preparing the confirmation mail.")
-      logger.error(err.message)
+      logger.error(str(err))
       context.set_code(grpc.StatusCode.INTERNAL)
       return demo_pb2.Empty()
 
     try:
-      EmailService.send_email(self.client, email, confirmation)
-    except GoogleAPICallError as err:
+      self._send_email(email, confirmation)
+      logger.info("Order confirmation email sent to {}".format(email))
+    except Exception as err:
       context.set_details("An error occurred when sending the email.")
-      print(err.message)
+      logger.error("Failed to send email to {}: {}".format(email, str(err)))
       context.set_code(grpc.StatusCode.INTERNAL)
       return demo_pb2.Empty()
 
     return demo_pb2.Empty()
+
 
 class DummyEmailService(BaseEmailService):
   def SendOrderConfirmation(self, request, context):
     logger.info('A request to send order confirmation email to {} has been received.'.format(request.email))
     return demo_pb2.Empty()
 
-class HealthCheck():
-  def Check(self, request, context):
-    return health_pb2.HealthCheckResponse(
-      status=health_pb2.HealthCheckResponse.SERVING)
 
 def start(dummy_mode):
-  server = grpc.server(futures.ThreadPoolExecutor(max_workers=10),)
-  service = None
+  server = grpc.server(futures.ThreadPoolExecutor(max_workers=10))
   if dummy_mode:
     service = DummyEmailService()
+    logger.info("Starting in DUMMY mode — emails will not be sent.")
   else:
-    raise Exception('non-dummy mode not implemented yet')
+    service = GmailEmailService()
+    logger.info("Starting in GMAIL mode — emails will be sent via Gmail SMTP.")
 
   demo_pb2_grpc.add_EmailServiceServicer_to_server(service, server)
   health_pb2_grpc.add_HealthServicer_to_server(service, server)
 
   port = os.environ.get('PORT', "8080")
-  logger.info("listening on port: "+port)
-  server.add_insecure_port('[::]:'+port)
+  logger.info("listening on port: " + port)
+  server.add_insecure_port('[::]:' + port)
   server.start()
   try:
     while True:
@@ -136,45 +135,14 @@ def start(dummy_mode):
   except KeyboardInterrupt:
     server.stop(0)
 
-def initStackdriverProfiling():
-  project_id = None
-  try:
-    project_id = os.environ["GCP_PROJECT_ID"]
-  except KeyError:
-    # Environment variable not set
-    pass
-
-  # @TODO: Temporarily removed in https://github.com/GoogleCloudPlatform/microservices-demo/pull/3196
-  # for retry in range(1,4):
-  #   try:
-  #     if project_id:
-  #       googlecloudprofiler.start(service='email_server', service_version='1.0.0', verbose=0, project_id=project_id)
-  #     else:
-  #       googlecloudprofiler.start(service='email_server', service_version='1.0.0', verbose=0)
-  #     logger.info("Successfully started Stackdriver Profiler.")
-  #     return
-  #   except (BaseException) as exc:
-  #     logger.info("Unable to start Stackdriver Profiler Python agent. " + str(exc))
-  #     if (retry < 4):
-  #       logger.info("Sleeping %d to retry initializing Stackdriver Profiler"%(retry*10))
-  #       time.sleep (1)
-  #     else:
-  #       logger.warning("Could not initialize Stackdriver Profiler after retrying, giving up")
-  return
-
 
 if __name__ == '__main__':
-  logger.info('starting the email service in dummy mode.')
-
-  # Profiler
-  try:
-    if "DISABLE_PROFILER" in os.environ:
-      raise KeyError()
-    else:
-      logger.info("Profiler enabled.")
-      initStackdriverProfiling()
-  except KeyError:
-      logger.info("Profiler disabled.")
+  # Use Gmail SMTP when credentials are provided; fall back to dummy mode
+  dummy_mode = not (os.environ.get('GMAIL_ADDRESS') and os.environ.get('GMAIL_APP_PASSWORD'))
+  if dummy_mode:
+    logger.info('Starting email service in DUMMY mode (set GMAIL_ADDRESS and GMAIL_APP_PASSWORD to enable real sending).')
+  else:
+    logger.info('Starting email service in GMAIL mode.')
 
   # Tracing
   try:
@@ -183,9 +151,9 @@ if __name__ == '__main__':
       trace.set_tracer_provider(TracerProvider())
       trace.get_tracer_provider().add_span_processor(
         BatchSpanProcessor(
-            OTLPSpanExporter(
-            endpoint = otel_endpoint,
-            insecure = True
+          OTLPSpanExporter(
+            endpoint=otel_endpoint,
+            insecure=True
           )
         )
       )
@@ -193,8 +161,8 @@ if __name__ == '__main__':
     grpc_server_instrumentor.instrument()
 
   except (KeyError, DefaultCredentialsError):
-      logger.info("Tracing disabled.")
+    logger.info("Tracing disabled.")
   except Exception as e:
-      logger.warn(f"Exception on Cloud Trace setup: {traceback.format_exc()}, tracing disabled.") 
-  
-  start(dummy_mode = True)
+    logger.warning(f"Exception on Cloud Trace setup: {traceback.format_exc()}, tracing disabled.")
+
+  start(dummy_mode=dummy_mode)
